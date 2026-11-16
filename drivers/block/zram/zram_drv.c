@@ -1810,10 +1810,11 @@ static int zram_recompress(struct zram *zram, u32 index, struct page *page,
 			       __GFP_KSWAPD_RECLAIM |
 			       __GFP_NOWARN |
 			       __GFP_HIGHMEM |
-			       __GFP_MOVABLE);
-	if (IS_ERR_VALUE(handle_new)) {
+			       __GFP_MOVABLE |
+			       __GFP_CMA);
+	if (!handle_new) {
 		zcomp_stream_put(zram->comps[prio]);
-		return PTR_ERR((void *)handle_new);
+		return -ENOMEM;
 	}
 
 	dst = zs_map_object(zram->mem_pool, handle_new, ZS_MM_WO);
