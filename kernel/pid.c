@@ -539,6 +539,7 @@ struct pid *pidfd_get_pid(unsigned int fd, unsigned int *flags)
 	fdput(f);
 	return pid;
 }
+EXPORT_SYMBOL_GPL(pidfd_get_pid);
 
 /**
  * pidfd_create() - Create a new pid file descriptor.
