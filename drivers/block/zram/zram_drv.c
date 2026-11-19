@@ -682,14 +682,141 @@ static int read_from_bdev_async(struct zram *zram, struct bio_vec *bvec,
 #define IDLE_WRITEBACK			(1<<1)
 #define INCOMPRESSIBLE_WRITEBACK	(1<<2)
 
+/*
+ * Make sure a free backing device block is cached in *blk_idx and the
+ * writeback limit is not exhausted. Returns 0 or a negative errno that
+ * must stop the writeback.
+ */
+static int zram_wb_get_block(struct zram *zram, unsigned long *blk_idx)
+{
+	spin_lock(&zram->wb_limit_lock);
+	if (zram->wb_limit_enable && !zram->bd_wb_limit) {
+		spin_unlock(&zram->wb_limit_lock);
+		return -EIO;
+	}
+	spin_unlock(&zram->wb_limit_lock);
+
+	if (!*blk_idx) {
+		*blk_idx = alloc_block_bdev(zram);
+		if (!*blk_idx)
+			return -ENOSPC;
+	}
+	return 0;
+}
+
+/*
+ * Write slot @index to backing device block @blk_idx if it matches @mode.
+ * @page is a scratch page. Returns 1 if the slot was written back (and
+ * @blk_idx consumed), 0 if it was skipped, or a negative errno on I/O error.
+ * Callers must hold zram->init_lock in read mode.
+ */
+static int zram_writeback_slot(struct zram *zram, u32 index, int mode,
+			       struct page *page, unsigned long blk_idx)
+{
+	struct bio bio;
+	struct bio_vec bio_vec;
+	struct bio_vec bvec = {
+		.bv_page = page,
+		.bv_len = PAGE_SIZE,
+		.bv_offset = 0,
+	};
+	int err;
+
+	zram_slot_lock(zram, index);
+	if (!zram_allocated(zram, index))
+		goto skip;
+
+	if (zram_test_flag(zram, index, ZRAM_WB) ||
+			zram_test_flag(zram, index, ZRAM_SAME) ||
+			zram_test_flag(zram, index, ZRAM_UNDER_WB))
+		goto skip;
+
+	if (mode & IDLE_WRITEBACK &&
+	    !zram_test_flag(zram, index, ZRAM_IDLE))
+		goto skip;
+	if (mode & HUGE_WRITEBACK &&
+	    !zram_test_flag(zram, index, ZRAM_HUGE))
+		goto skip;
+	if (mode & INCOMPRESSIBLE_WRITEBACK &&
+	    !zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE))
+		goto skip;
+
+	/*
+	 * Clearing ZRAM_UNDER_WB is duty of caller.
+	 * IOW, zram_free_page never clear it.
+	 */
+	zram_set_flag(zram, index, ZRAM_UNDER_WB);
+	/* Need for hugepage writeback racing */
+	zram_set_flag(zram, index, ZRAM_IDLE);
+	zram_slot_unlock(zram, index);
+	if (zram_bvec_read(zram, &bvec, index, 0, NULL)) {
+		zram_slot_lock(zram, index);
+		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
+		zram_clear_flag(zram, index, ZRAM_IDLE);
+		zram_slot_unlock(zram, index);
+		return 0;
+	}
+
+	bio_init(&bio, &bio_vec, 1);
+	bio_set_dev(&bio, zram->bdev);
+	bio.bi_iter.bi_sector = blk_idx * (PAGE_SIZE >> 9);
+	bio.bi_opf = REQ_OP_WRITE | REQ_SYNC;
+
+	bio_add_page(&bio, bvec.bv_page, bvec.bv_len,
+			bvec.bv_offset);
+	/*
+	 * XXX: A single page IO would be inefficient for write
+	 * but it would be not bad as starter.
+	 */
+	err = submit_bio_wait(&bio);
+	if (err) {
+		zram_slot_lock(zram, index);
+		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
+		zram_clear_flag(zram, index, ZRAM_IDLE);
+		zram_slot_unlock(zram, index);
+		return err;
+	}
+
+	atomic64_inc(&zram->stats.bd_writes);
+	/*
+	 * We released zram_slot_lock so need to check if the slot was
+	 * changed. If there is freeing for the slot, we can catch it
+	 * easily by zram_allocated.
+	 * A subtle case is the slot is freed/reallocated/marked as
+	 * ZRAM_IDLE again. To close the race, idle_store doesn't
+	 * mark ZRAM_IDLE once it found the slot was ZRAM_UNDER_WB.
+	 * Thus, we could close the race by checking ZRAM_IDLE bit.
+	 */
+	zram_slot_lock(zram, index);
+	if (!zram_allocated(zram, index) ||
+		  !zram_test_flag(zram, index, ZRAM_IDLE)) {
+		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
+		zram_clear_flag(zram, index, ZRAM_IDLE);
+		goto skip;
+	}
+
+	zram_free_page(zram, index);
+	zram_clear_flag(zram, index, ZRAM_UNDER_WB);
+	zram_set_flag(zram, index, ZRAM_WB);
+	zram_set_element(zram, index, blk_idx);
+	atomic64_inc(&zram->stats.pages_stored);
+	spin_lock(&zram->wb_limit_lock);
+	if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
+		zram->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
+	spin_unlock(&zram->wb_limit_lock);
+	zram_slot_unlock(zram, index);
+	return 1;
+skip:
+	zram_slot_unlock(zram, index);
+	return 0;
+}
+
 static ssize_t writeback_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t len)
 {
 	struct zram *zram = dev_to_zram(dev);
 	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
 	unsigned long index = 0;
-	struct bio bio;
-	struct bio_vec bio_vec;
 	struct page *page;
 	ssize_t ret = len;
 	int mode, err;
@@ -733,118 +860,21 @@ static ssize_t writeback_store(struct device *dev,
 	}
 
 	for (; nr_pages != 0; index++, nr_pages--) {
-		struct bio_vec bvec;
-
-		bvec.bv_page = page;
-		bvec.bv_len = PAGE_SIZE;
-		bvec.bv_offset = 0;
-
-		spin_lock(&zram->wb_limit_lock);
-		if (zram->wb_limit_enable && !zram->bd_wb_limit) {
-			spin_unlock(&zram->wb_limit_lock);
-			ret = -EIO;
+		err = zram_wb_get_block(zram, &blk_idx);
+		if (err) {
+			ret = err;
 			break;
 		}
-		spin_unlock(&zram->wb_limit_lock);
 
-		if (!blk_idx) {
-			blk_idx = alloc_block_bdev(zram);
-			if (!blk_idx) {
-				ret = -ENOSPC;
-				break;
-			}
-		}
-
-		zram_slot_lock(zram, index);
-		if (!zram_allocated(zram, index))
-			goto next;
-
-		if (zram_test_flag(zram, index, ZRAM_WB) ||
-				zram_test_flag(zram, index, ZRAM_SAME) ||
-				zram_test_flag(zram, index, ZRAM_UNDER_WB))
-			goto next;
-
-		if (mode & IDLE_WRITEBACK &&
-		    !zram_test_flag(zram, index, ZRAM_IDLE))
-			goto next;
-		if (mode & HUGE_WRITEBACK &&
-		    !zram_test_flag(zram, index, ZRAM_HUGE))
-			goto next;
-		if (mode & INCOMPRESSIBLE_WRITEBACK &&
-		    !zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE))
-			goto next;
-
-		/*
-		 * Clearing ZRAM_UNDER_WB is duty of caller.
-		 * IOW, zram_free_page never clear it.
-		 */
-		zram_set_flag(zram, index, ZRAM_UNDER_WB);
-		/* Need for hugepage writeback racing */
-		zram_set_flag(zram, index, ZRAM_IDLE);
-		zram_slot_unlock(zram, index);
-		if (zram_bvec_read(zram, &bvec, index, 0, NULL)) {
-			zram_slot_lock(zram, index);
-			zram_clear_flag(zram, index, ZRAM_UNDER_WB);
-			zram_clear_flag(zram, index, ZRAM_IDLE);
-			zram_slot_unlock(zram, index);
-			continue;
-		}
-
-		bio_init(&bio, &bio_vec, 1);
-		bio_set_dev(&bio, zram->bdev);
-		bio.bi_iter.bi_sector = blk_idx * (PAGE_SIZE >> 9);
-		bio.bi_opf = REQ_OP_WRITE | REQ_SYNC;
-
-		bio_add_page(&bio, bvec.bv_page, bvec.bv_len,
-				bvec.bv_offset);
-		/*
-		 * XXX: A single page IO would be inefficient for write
-		 * but it would be not bad as starter.
-		 */
-		err = submit_bio_wait(&bio);
-		if (err) {
-			zram_slot_lock(zram, index);
-			zram_clear_flag(zram, index, ZRAM_UNDER_WB);
-			zram_clear_flag(zram, index, ZRAM_IDLE);
-			zram_slot_unlock(zram, index);
+		err = zram_writeback_slot(zram, index, mode, page, blk_idx);
+		if (err > 0)
+			blk_idx = 0;
+		else if (err < 0)
 			/*
 			 * Return last IO error unless every IO were
 			 * not suceeded.
 			 */
 			ret = err;
-			continue;
-		}
-
-		atomic64_inc(&zram->stats.bd_writes);
-		/*
-		 * We released zram_slot_lock so need to check if the slot was
-		 * changed. If there is freeing for the slot, we can catch it
-		 * easily by zram_allocated.
-		 * A subtle case is the slot is freed/reallocated/marked as
-		 * ZRAM_IDLE again. To close the race, idle_store doesn't
-		 * mark ZRAM_IDLE once it found the slot was ZRAM_UNDER_WB.
-		 * Thus, we could close the race by checking ZRAM_IDLE bit.
-		 */
-		zram_slot_lock(zram, index);
-		if (!zram_allocated(zram, index) ||
-			  !zram_test_flag(zram, index, ZRAM_IDLE)) {
-			zram_clear_flag(zram, index, ZRAM_UNDER_WB);
-			zram_clear_flag(zram, index, ZRAM_IDLE);
-			goto next;
-		}
-
-		zram_free_page(zram, index);
-		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
-		zram_set_flag(zram, index, ZRAM_WB);
-		zram_set_element(zram, index, blk_idx);
-		blk_idx = 0;
-		atomic64_inc(&zram->stats.pages_stored);
-		spin_lock(&zram->wb_limit_lock);
-		if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
-			zram->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
-		spin_unlock(&zram->wb_limit_lock);
-next:
-		zram_slot_unlock(zram, index);
 	}
 
 	if (blk_idx)
