@@ -28,6 +28,16 @@ config ZRAM_WRITEBACK
 
 	 See Documentation/admin-guide/blockdev/zram.rst for more information.
 
+config ZRAM_ANDROID_IOCTL
+	bool "Android per-process zram writeback and prefetch ioctls"
+	depends on ZRAM_WRITEBACK
+	help
+	  Adds the Android ZRAM_ANDROID_IOC_* ioctls (version 1) on
+	  /dev/block/zramX. They are used by mmd to write back the
+	  swapped-out memory of one process (given as a pidfd) to the
+	  backing device, and to prefetch it back into zram before the
+	  process is used again.
+
 config ZRAM_TRACK_ENTRY_ACTIME
 	bool "Track access time of zram entries"
 	depends on ZRAM

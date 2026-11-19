@@ -34,6 +34,15 @@
 #include <linux/debugfs.h>
 #include <linux/cpuhotplug.h>
 #include <linux/part_stat.h>
+#ifdef CONFIG_ZRAM_ANDROID_IOCTL
+#include <linux/pagewalk.h>
+#include <linux/pid.h>
+#include <linux/sched/mm.h>
+#include <linux/sched/task.h>
+#include <linux/swap.h>
+#include <linux/swapops.h>
+#include <uapi/linux/zram_ioctl.h>
+#endif
 
 #include "zram_drv.h"
 
@@ -1553,8 +1562,18 @@ out:
 	return ret;
 }
 
-static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
-				u32 index, struct bio *bio)
+/*
+ * Compress @page and store it in slot @index.
+ *
+ * If @wb_blk is non-zero the store is conditional (used by prefetch): the
+ * caller has set ZRAM_UNDER_WB and ZRAM_IDLE on a ZRAM_WB slot, and the slot
+ * is only replaced if it still holds backing device block @wb_blk and is
+ * still ZRAM_IDLE (any free or access in the meantime clears ZRAM_IDLE, and
+ * idle marking skips ZRAM_UNDER_WB slots). Otherwise -ESTALE is returned.
+ * On both outcomes ZRAM_UNDER_WB is cleared; on other errors it is not.
+ */
+static int zram_write_page(struct zram *zram, struct page *page, u32 index,
+			   unsigned long wb_blk)
 {
 	int ret = 0;
 	unsigned long alloced_pages;
@@ -1562,7 +1581,6 @@ static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
 	unsigned int comp_len = 0;
 	void *src, *dst, *mem;
 	struct zcomp_strm *zstrm;
-	struct page *page = bvec->bv_page;
 	unsigned long element = 0;
 	enum zram_pageflags flags = 0;
 
@@ -1659,6 +1677,25 @@ out:
 	 * before overwriting unused sectors.
 	 */
 	zram_slot_lock(zram, index);
+	if (wb_blk) {
+		bool stale = !zram_test_flag(zram, index, ZRAM_WB) ||
+			     !zram_test_flag(zram, index, ZRAM_IDLE) ||
+			     zram_get_element(zram, index) != wb_blk;
+
+		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
+		if (stale) {
+			zram_clear_flag(zram, index, ZRAM_IDLE);
+			zram_slot_unlock(zram, index);
+			if (flags) {
+				atomic64_dec(&zram->stats.same_pages);
+			} else {
+				zs_free(zram->mem_pool, handle);
+				atomic64_sub(comp_len,
+					     &zram->stats.compr_data_size);
+			}
+			return -ESTALE;
+		}
+	}
 	zram_free_page(zram, index);
 
 	if (comp_len == PAGE_SIZE) {
@@ -1678,6 +1715,12 @@ out:
 	/* Update stats */
 	atomic64_inc(&zram->stats.pages_stored);
 	return ret;
+}
+
+static int __zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
+				u32 index, struct bio *bio)
+{
+	return zram_write_page(zram, bvec->bv_page, index, 0);
 }
 
 static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec,
@@ -2354,11 +2397,386 @@ static int zram_open(struct block_device *bdev, fmode_t mode)
 	return ret;
 }
 
+#ifdef CONFIG_ZRAM_ANDROID_IOCTL
+/*
+ * Android per-process zram ioctls (ZRAM_ANDROID_IOC_*, version 1), adapted
+ * from ACK android16-6.12 drivers/block/zram/zram_ioctl.c for 5.10:
+ * - 5.10 has no zram_pp_ctl/zram_wb_ctl; candidate slots are collected in a
+ *   bitmap and processed with the sysfs writeback per-slot helper.
+ * - 5.10 writes back decompressed pages, so prefetch reads the page and
+ *   recompresses it (conditional store, see zram_write_page()).
+ * - The legacy ZRAM_ANDROID_IOC_PROCESS_WRITEBACK (neverallowed by sepolicy)
+ *   is not implemented.
+ */
+#define ZRAM_NR_PAGES_UNLIMITED	U64_MAX
+
+struct zram_process_walk_private {
+	struct zram *zram;
+	unsigned long *slots;		/* bitmap of candidate zram slots */
+	u64 nr_remaining_pages;
+	unsigned long next_addr;
+};
+
+static inline bool zram_can_do_file_pageout(struct vm_area_struct *vma)
+{
+	if (!vma->vm_file)
+		return false;
+	/*
+	 * paging out pagecache only for non-anonymous mappings that correspond
+	 * to the files the calling process could (if tried) open for writing;
+	 * otherwise we would be including shared non-exclusive mappings, which
+	 * opens a side channel.
+	 */
+	return inode_owner_or_capable(file_inode(vma->vm_file)) ||
+		inode_permission(file_inode(vma->vm_file), MAY_WRITE) == 0;
+}
+
+static int zram_process_walker(pmd_t *pmd, unsigned long start,
+			       unsigned long end, struct mm_walk *walk)
+{
+	struct zram_process_walk_private *priv = walk->private;
+	struct zram *zram = priv->zram;
+	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
+	pte_t *start_pte, *ptep;
+	spinlock_t *ptl;
+	unsigned long addr;
+	int ret = 0;
+
+	if (pmd_trans_unstable(pmd))
+		return 0;
+
+	start_pte = ptep = pte_offset_map_lock(walk->mm, pmd, start, &ptl);
+	for (addr = start; addr < end; addr += PAGE_SIZE, ptep++) {
+		struct swap_info_struct *sis;
+		swp_entry_t entry;
+		pte_t pte = *ptep;
+		pgoff_t index;
+
+		if (priv->nr_remaining_pages == 0) {
+			priv->next_addr = addr;
+			ret = 1;
+			break;
+		}
+
+		if (!is_swap_pte(pte))
+			continue;
+		entry = pte_to_swp_entry(pte);
+		if (unlikely(non_swap_entry(entry)))
+			continue;
+
+		/*
+		 * The PTE lock is held and the PTE still holds this swap
+		 * entry, so swapoff cannot have finished with this device.
+		 */
+		sis = swp_swap_info(entry);
+		if (unlikely(!sis || !sis->bdev || !sis->bdev->bd_disk ||
+			     sis->bdev->bd_disk->private_data != zram))
+			continue;
+
+		index = swp_offset(entry);
+		if (unlikely(index >= nr_pages))
+			continue;
+
+		__set_bit(index, priv->slots);
+		if (priv->nr_remaining_pages != ZRAM_NR_PAGES_UNLIMITED)
+			priv->nr_remaining_pages--;
+	}
+	pte_unmap_unlock(start_pte, ptl);
+	cond_resched();
+
+	return ret;
+}
+
+static const struct mm_walk_ops zram_process_walk_ops = {
+	.pmd_entry = zram_process_walker,
+};
+
+/*
+ * Collect the zram slots holding swapped-out pages of the process behind
+ * @pidfd, starting at @start_addr and stopping after @size bytes worth of
+ * candidates (0 = unlimited). *next_addr is where a size-limited scan
+ * stopped, or 0 if it reached the end of the address space.
+ */
+static int zram_process_scan(struct zram *zram, u64 pidfd, u64 start_addr,
+			     u64 size, unsigned long *slots, u64 *next_addr)
+{
+	struct zram_process_walk_private priv = {
+		.zram = zram,
+		.slots = slots,
+	};
+	struct vm_area_struct *vma;
+	struct task_struct *task;
+	struct mm_struct *mm;
+	unsigned int f_flags;
+	struct pid *pid;
+	int ret = 0;
+
+	*next_addr = 0;
+	priv.nr_remaining_pages = size ? DIV_ROUND_UP(size, PAGE_SIZE) :
+					  ZRAM_NR_PAGES_UNLIMITED;
+
+	if (pidfd > INT_MAX)
+		return -EBADF;
+	if (!IS_ALIGNED(start_addr, PAGE_SIZE))
+		return -EINVAL;
+
+	pid = pidfd_get_pid(pidfd, &f_flags);
+	if (IS_ERR(pid))
+		return PTR_ERR(pid);
+	task = get_pid_task(pid, PIDTYPE_TGID);
+	put_pid(pid);
+	if (!task)
+		return -ESRCH;
+
+	mm = get_task_mm(task);
+	if (!mm) {
+		ret = -ESRCH;
+		goto release_task;
+	}
+
+	if (start_addr >= mm->task_size) {
+		ret = -EINVAL;
+		goto release_mm;
+	}
+
+	mmap_read_lock(mm);
+	for (vma = find_vma(mm, start_addr); vma; vma = vma->vm_next) {
+		unsigned long start = max_t(unsigned long, vma->vm_start,
+					    start_addr);
+
+		if (!vma_is_anonymous(vma) && !zram_can_do_file_pageout(vma) &&
+		    (vma->vm_flags & VM_MAYSHARE))
+			continue;
+
+		ret = walk_page_range(mm, start, vma->vm_end,
+				      &zram_process_walk_ops, &priv);
+		if (ret)
+			break;
+	}
+	mmap_read_unlock(mm);
+
+	if (ret > 0) {
+		*next_addr = priv.next_addr;
+		ret = 0;
+	}
+release_mm:
+	mmput(mm);
+release_task:
+	put_task_struct(task);
+	return ret;
+}
+
+/*
+ * Read written-back slot @index from the backing device and store it in
+ * zram again. Returns 1 if the slot was restored, 0 if it was skipped, or a
+ * negative errno.
+ */
+static int zram_prefetch_slot(struct zram *zram, u32 index, struct page *page)
+{
+	unsigned long blk_idx;
+	struct bio_vec bio_vec;
+	struct bio bio;
+	int err;
+
+	zram_slot_lock(zram, index);
+	if (!zram_test_flag(zram, index, ZRAM_WB) ||
+	    zram_test_flag(zram, index, ZRAM_UNDER_WB)) {
+		zram_slot_unlock(zram, index);
+		return 0;
+	}
+	blk_idx = zram_get_element(zram, index);
+	/* Same race protocol as zram_writeback_slot(). */
+	zram_set_flag(zram, index, ZRAM_UNDER_WB);
+	zram_set_flag(zram, index, ZRAM_IDLE);
+	zram_slot_unlock(zram, index);
+
+	bio_init(&bio, &bio_vec, 1);
+	bio_set_dev(&bio, zram->bdev);
+	bio.bi_iter.bi_sector = blk_idx * (PAGE_SIZE >> 9);
+	bio.bi_opf = REQ_OP_READ | REQ_SYNC;
+	bio_add_page(&bio, page, PAGE_SIZE, 0);
+	atomic64_inc(&zram->stats.bd_reads);
+
+	err = submit_bio_wait(&bio);
+	if (!err)
+		err = zram_write_page(zram, page, index, blk_idx);
+	if (err == -ESTALE)
+		return 0;
+	if (err) {
+		zram_slot_lock(zram, index);
+		zram_clear_flag(zram, index, ZRAM_UNDER_WB);
+		zram_clear_flag(zram, index, ZRAM_IDLE);
+		zram_slot_unlock(zram, index);
+		return err;
+	}
+
+	zram_slot_lock(zram, index);
+	zram_accessed(zram, index);
+	zram_slot_unlock(zram, index);
+	return 1;
+}
+
+static int zram_ioctl_process(struct zram *zram, bool prefetch, u64 pidfd,
+			      u64 start_addr, u64 size, u64 *next_addr,
+			      u64 *done_bytes)
+{
+	unsigned long nr_pages, index, blk_idx = 0;
+	unsigned long *slots = NULL;
+	struct page *page = NULL;
+	int ret, err;
+
+	*next_addr = 0;
+	*done_bytes = 0;
+
+	/* Require CAP_SYS_NICE for influencing process performance. */
+	if (!capable(CAP_SYS_NICE))
+		return -EPERM;
+
+	down_read(&zram->init_lock);
+	if (!init_done(zram)) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+	if (!zram->backing_dev) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+
+	nr_pages = zram->disksize >> PAGE_SHIFT;
+	slots = kvcalloc(BITS_TO_LONGS(nr_pages), sizeof(unsigned long),
+			 GFP_KERNEL);
+	page = alloc_page(GFP_KERNEL);
+	if (!slots || !page) {
+		ret = -ENOMEM;
+		goto out_free;
+	}
+
+	ret = zram_process_scan(zram, pidfd, start_addr, size, slots,
+				next_addr);
+	if (ret)
+		goto out_free;
+
+	for_each_set_bit(index, slots, nr_pages) {
+		if (fatal_signal_pending(current)) {
+			ret = -EINTR;
+			break;
+		}
+
+		if (prefetch) {
+			err = zram_prefetch_slot(zram, index, page);
+			if (err > 0) {
+				*done_bytes += PAGE_SIZE;
+			} else if (err < 0) {
+				ret = err;
+				if (err == -ENOMEM)
+					break;
+			}
+		} else {
+			err = zram_wb_get_block(zram, &blk_idx);
+			if (err) {
+				ret = err;
+				break;
+			}
+			err = zram_writeback_slot(zram, index, PAGE_WRITEBACK,
+						  page, blk_idx);
+			if (err > 0) {
+				blk_idx = 0;
+				*done_bytes += PAGE_SIZE;
+			} else if (err < 0) {
+				/* BIO errors are not fatal, keep going. */
+				ret = err;
+			}
+		}
+		cond_resched();
+	}
+
+	if (blk_idx)
+		free_block_bdev(zram, blk_idx);
+out_free:
+	if (page)
+		__free_page(page);
+	kvfree(slots);
+out_unlock:
+	up_read(&zram->init_lock);
+	return ret;
+}
+
+static int zram_ioctl_process_prefetch_user(struct zram *zram,
+					    unsigned int cmd, void __user *argp)
+{
+	struct zram_android_ioc_process_prefetch kprefetch;
+	size_t usize = _IOC_SIZE(cmd);
+	u64 next_addr;
+	int ret;
+
+	BUILD_BUG_ON(offsetofend(struct zram_android_ioc_process_prefetch,
+				 pidfd) !=
+		     ZRAM_ANDROID_IOC_PROCESS_PREFETCH_SIZE_VER0);
+	BUILD_BUG_ON(sizeof(kprefetch) !=
+		     ZRAM_ANDROID_IOC_PROCESS_PREFETCH_SIZE_VER1);
+
+	if (!(_IOC_DIR(cmd) & _IOC_WRITE) ||
+	    usize < ZRAM_ANDROID_IOC_PROCESS_PREFETCH_SIZE_VER0)
+		return -ENOTTY;
+
+	ret = copy_struct_from_user(&kprefetch, sizeof(kprefetch), argp,
+				    usize);
+	if (ret)
+		return ret;
+	if (kprefetch.flags)
+		return -EINVAL;
+
+	kprefetch.size = sizeof(kprefetch);
+	ret = zram_ioctl_process(zram, true, kprefetch.pidfd, 0, 0,
+				 &next_addr, &kprefetch.read_bytes);
+
+	if ((_IOC_DIR(cmd) & _IOC_READ) &&
+	    copy_to_user(argp, &kprefetch, min(usize, sizeof(kprefetch))))
+		ret = -EFAULT;
+	return ret;
+}
+
+static int zram_ioctl(struct block_device *bdev, fmode_t mode,
+		      unsigned int cmd, unsigned long arg)
+{
+	struct zram *zram = bdev->bd_disk->private_data;
+	void __user *argp = (void __user *)arg;
+
+	if (cmd == ZRAM_ANDROID_IOC_GET_VERSION)
+		return ZRAM_ANDROID_IOC_VERSION;
+
+	if (cmd == ZRAM_ANDROID_IOC_PROCESS_RANGE_WRITEBACK) {
+		struct zram_android_ioc_process_range_writeback prwb;
+		int ret;
+
+		if (copy_from_user(&prwb, argp, sizeof(prwb)))
+			return -EFAULT;
+
+		ret = zram_ioctl_process(zram, false, prwb.pidfd,
+					 prwb.start_addr, prwb.size,
+					 &prwb.next_addr, &prwb.written_bytes);
+
+		if (copy_to_user(argp, &prwb, sizeof(prwb)))
+			ret = -EFAULT;
+		return ret;
+	}
+
+	if (_IOC_TYPE(cmd) == ZRAM_ANDROID_IOC_MAGIC &&
+	    _IOC_NR(cmd) == _IOC_NR(ZRAM_ANDROID_IOC_PROCESS_PREFETCH))
+		return zram_ioctl_process_prefetch_user(zram, cmd, argp);
+
+	return -ENOTTY;
+}
+#endif /* CONFIG_ZRAM_ANDROID_IOCTL */
+
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
 	.swap_slot_free_notify = zram_slot_free_notify,
 	.rw_page = zram_rw_page,
+#ifdef CONFIG_ZRAM_ANDROID_IOCTL
+	.ioctl = zram_ioctl,
+#endif
 	.owner = THIS_MODULE
 };
 
