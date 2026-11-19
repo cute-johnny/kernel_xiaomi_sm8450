@@ -326,7 +326,9 @@ static int gsx_gesture_before_suspend(struct goodix_ts_core *cd,
 		ts_info("enter gesture mode, type[0x%02X]", cd->gesture_type);
 
 	hw_ops->irq_enable(cd, true);
-	enable_irq_wake(cd->irq);
+	cd->gesture_suspended = true;
+	if (!cd->gesture_irq_wake && !enable_irq_wake(cd->irq))
+		cd->gesture_irq_wake = true;
 
 	return EVT_CANCEL_SUSPEND;
 }
@@ -336,10 +338,21 @@ static int gsx_gesture_before_resume(struct goodix_ts_core *cd,
 {
 	const struct goodix_ts_hw_ops *hw_ops = cd->hw_ops;
 
-	if (cd->gesture_type == 0)
+	/*
+	 * Decide by what the last suspend did, not by the current
+	 * gesture_type: it can be changed while the panel is off (e.g.
+	 * double-tap/FOD toggled by the touch/fingerprint HAL), which
+	 * left enable/disable_irq_wake() unbalanced ("Unbalanced IRQ 322
+	 * wake disable" WARNING, or the IRQ left armed as a wake source).
+	 */
+	if (cd->gesture_irq_wake) {
+		disable_irq_wake(cd->irq);
+		cd->gesture_irq_wake = false;
+	}
+	if (!cd->gesture_suspended)
 		return EVT_CONTINUE;
+	cd->gesture_suspended = false;
 
-	disable_irq_wake(cd->irq);
 	hw_ops->reset(cd, GOODIX_NORMAL_RESET_DELAY_MS);
 
 	return EVT_CANCEL_RESUME;

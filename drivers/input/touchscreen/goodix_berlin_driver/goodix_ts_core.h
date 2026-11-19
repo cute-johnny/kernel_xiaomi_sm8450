@@ -512,6 +512,9 @@ struct goodix_ts_core {
 	struct regulator *avdd;
 	struct regulator *iovdd;
 	unsigned char gesture_type;
+	/* gesture mode (and its irq wake) entered by the last suspend */
+	bool gesture_suspended;
+	bool gesture_irq_wake;
 
 	int power_on;
 	int irq;
