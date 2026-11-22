@@ -28,6 +28,17 @@ config ZRAM_WRITEBACK
 
 	 See Documentation/admin-guide/blockdev/zram.rst for more information.
 
+config ZRAM_COMPRESSED_WRITEBACK_DEFAULT
+	bool "Enable compressed data writeback by default"
+	depends on ZRAM_WRITEBACK
+	default n
+	help
+	  Initialize newly created zram devices with compressed_writeback
+	  enabled so writeback writes compressed zsmalloc objects directly
+	  to the backing device without decompressing them. Can still be
+	  overridden via /sys/block/zramX/compressed_writeback before
+	  disksize is set.
+
 config ZRAM_ANDROID_IOCTL
 	bool "Android per-process zram writeback and prefetch ioctls"
 	depends on ZRAM_WRITEBACK
